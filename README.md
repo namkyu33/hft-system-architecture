@@ -60,76 +60,48 @@ graph TD
 ## III. 핵심 설계 결정 (Key Design Decisions)
 
 ### A. 멀티-프로세스 아키텍처 (Multi-Process Architecture)
-- **목적**: **장애 격리(Fault Isolation)** 및 **무중단 배포(Zero-Downtime Deployment)**
-- **구현**: 데이터 수집(`datafeed`), 전략 실행(`strategy_runner`), 주문 집행(`order_executor`)을 물리적으로 분리했습니다. 특정 전략 로직에 버그가 발생하여 프로세스가 중단되더라도, 데이터 수집과 주문 집행 기능은 전혀 영향을 받지 않아 시스템 전체의 안정성을 유지할 수 있습니다.
+- **목적**: **장애 격리(Fault Isolation)** 및 **무중단 운영(Zero-Downtime)** 의 기반 마련.
+- **구현**: 데이터 수집(`datafeed`), 전략 실행(`strategy_runner`), 주문 집행(`order_executor`)을 물리적으로 분리했습니다. 특정 전략 로직의 버그로 `strategy_runner`가 비정상 종료되더라도, 데이터 수집과 다른 핵심 프로세스들은 전혀 영향을 받지 않아 시스템 전체의 안정성을 유지할 수 있습니다.
 
 ### B. 초저지연 IPC: 공유 메모리 & 링 버퍼 (Ultra-Low Latency IPC: Shared Memory & Ring Buffer)
-- **목적**: 프로세스 간 데이터 복사 오버헤드를 원천적으로 제거하여 최고 속도의 통신을 구현합니다.
-- **구현**: `Boost.Interprocess`를 활용한 **공유 메모리**를 통해 여러 프로세스가 동일한 메모리 영역에 직접 접근합니다. 데이터 스트림은 **락프리(Lock-Free) 링 버퍼**를 통해 전달되어, Mutex와 같은 동기화 오버헤드 없이 안전하고 빠른 데이터 공유를 보장합니다.
+- **목적**: 커널 개입(Context Switching) 및 데이터 복사 오버헤드를 원천적으로 제거하여 최고 속도의 통신을 구현합니다.
+- **구현**: `Boost.Interprocess`를 활용한 **공유 메모리**와 CPU 캐시에 친화적인 **락프리(Lock-Free) 링 버퍼**를 통해 데이터를 전달합니다. 이 설계는 시스템의 성능을 나노초 단위로 끌어올리는 핵심 기술입니다. **(자세한 성능은 VIII. 주요 성과 참조)**
 
-### C. POD 타입 전용 데이터 직렬화 (POD-only Data Serialization)
-- **목적**: 프로세스 간 ABI(Application Binary Interface) 호환성 문제를 방지하고 메모리 레이아웃을 예측 가능하게 유지합니다.
-- **구현**: 공유 메모리에 저장되는 모든 데이터 구조체는 `std::vector`, `std::string`과 같은 동적 컨테이너를 배제하고, C-스타일 고정 크기 배열과 `char[]`로만 구성된 **순수 POD(Plain Old Data) 타입**으로 정의합니다.
+### C. 데이터 무결성을 위한 타입 시스템 및 직렬화 (Type System & Serialization for Data Integrity)
+- **목적**: 부동소수점 오류를 원천 차단하고, 프로세스 간 데이터 전달의 안정성을 100% 보장합니다.
+- **구현**: 모든 금융 데이터(가격, 수량)는 `double` 대신 `Boost.Multiprecision` 기반의 고정소수점 클래스 **`FinancialDecimal`**을 사용합니다. 프로세스 간 통신에는 C-스타일 **POD 타입**과 안전성이 검증된 **문자열 기반 직렬화** 방식을 채택하여 메모리 오염 가능성을 원천적으로 제거했습니다.
 
 ### D. 완벽한 재현성을 위한 백테스팅 (Backtesting for 100% Reproducibility)
 - **목적**: 실거래 코드를 100% 동일하게 사용하여 과거 데이터로 전략의 성과를 검증합니다.
-- **구현**: `datafeed`는 실거래 API와 통신하는 `ExchangeGateway` 대신, `data_recorder`가 저장한 바이너리 파일을 재생하는 `ReplayGateway`를 사용합니다. `order_executor`는 실제 주문을 내는 대신 가상 체결을 시뮬레이션하는 `backtester` 프로세스로 교체됩니다. 이 과정에서 `strategy_runner`의 코드는 단 한 줄도 수정되지 않습니다.
+- **구현**: `DataFeed`는 `IExchangeGateway` 인터페이스를 통해 실거래 API 대신 로컬 바이너리 파일을 재생하는 `ReplayGateway`로 교체됩니다. 이 과정에서 `StrategyRunner`를 포함한 모든 하위 모듈의 코드는 단 한 줄도 수정되지 않아 시뮬레이션과 실제 거래 간의 논리적 불일치 가능성을 제거합니다.
 
 ### E. 느슨한 결합을 위한 인터페이스 기반 설계 (Interface-based Design for Loose Coupling)
-- **목적**: 새로운 거래소나 모듈을 추가할 때 기존 코드에 미치는 영향을 최소화합니다.
-- **구현**: `ApiClient`, `Gateway` 등 외부와 상호작용하는 모든 컴포넌트는 추상 인터페이스(pure virtual class)를 기반으로 설계되었습니다. 새로운 거래소를 추가하는 작업은 해당 인터페이스의 구현체를 새로 작성하는 것으로 단순화됩니다.
+- **목적**: 새로운 거래소, 전략, 데이터 포맷 등을 기존 코드에 미치는 영향을 최소화하며 유연하게 확장합니다.
+- **구현**: `IExchangeGateway`, `IStrategy` 등 시스템의 주요 컴포넌트는 모두 추상 인터페이스 기반으로 설계되었습니다. 팩토리 패턴과 결합하여, 새로운 기능을 추가하는 작업은 해당 인터페이스의 구현체를 새로 작성하고 등록하는 것으로 단순화됩니다.
 
 ## IV. 디렉터리 구조 (Directory Structure)
 ```
 hftsystem/
 ├── api/                        # 거래소 API 클라이언트 모듈
-│   ├── common/
-│   │   └── interfaces/         # API 추상 인터페이스 (IRestApiClient 등)
-│   └── exchanges/
-│       └── (exchange_name)/    # 거래소별 API 구현체 (bithumb, upbit 등)
-├── common/                     # 공통 유틸리티 (로깅, 데이터 구조, 에러 처리)
-├── config/                     # 시스템 및 전략 설정 파일 (JSON, YAML)
-│   ├── exchanges/              # 거래소별 설정
-│   ├── order_rules/            # 주문 규칙 설정
-│   ├── strategies/             # 전략 파라미터 설정
-│   └── tick_rules/             # 틱 데이터 규칙 설정
+├── common/                     # 공통 유틸리티 (금융 타입, 데이터 구조)
+├── config/                     # 시스템 및 전략 설정 파일 (JSON)
 ├── data/                       # 백테스팅 및 분석용 데이터 저장소
-├── data_store/                 # 인메모리 데이터 저장소 (공유 메모리 IPC 구현)
-├── execution_engine/           # 주문 실행 엔진 코어 로직
-├── gateways/                   # 데이터 소스 추상화 게이트웨이 (ExchangeGateway 등)
-├── interfaces/                 # 최상위 추상 인터페이스 (IGateway 등)
-├── logs/                       # 실행 로그 저장소
+├── data_store/                 # 공유 메모리 IPC 및 데이터 저장소 구현
+├── gateways/                   # 데이터 소스 추상화 게이트웨이
+├── interfaces/                 # 최상위 추상 인터페이스 (IExchangeGateway 등)
 ├── managers/                   # 핵심 비즈니스 로직 관리 모듈
-│   ├── account_manager/        # 계좌 및 잔고 관리
-│   ├── configuration_manager/  # 설정 로딩 및 관리
-│   ├── order_book_manager/     # 호가창 상태 관리
-│   ├── order_manager/          # 주문 상태 및 라이프사이클 관리
-│   ├── risk_manager/           # 주문 전 리스크 검증
-│   └── trade_manager/          # 체결 및 포지션 관리
 ├── processes/                  # 독립 실행 파일 (main) 소스 코드
-│   ├── backtester/             # 백테스팅 주문 체결기 프로세스
-│   ├── data_recorder/          # 데이터 기록 프로세스
-│   ├── datafeed/               # 데이터 수집 프로세스
-│   ├── order_executor/         # 주문 집행 프로세스
-│   └── strategy_runner/        # 전략 실행기 프로세스
-├── scripts/                    # 자동화 스크립트 (빌드, 실행, 배포)
-├── state/                      # 전략 상태 영구 저장소 (예정)
 ├── strategies/                 # 개별 거래 전략 구현 코드
 ├── strategy_engine/            # 전략 실행 엔진 코어 로직
-│   ├── interfaces/             # 전략 로직 추상 인터페이스 (IStrategy)
-│   └── src/                    # 엔진 구현부
-├── tests/                      # 단위/통합 테스트 코드
+├── tests/                      # 단위/통합 테스트 코드 (GTest)
+├── tools/                      # 데이터 변환/분석용 보조 도구
 ├── utils/                      # 기타 보조 유틸리티
-├── build/                      # 빌드 산출물 (바이너리, 라이버리)
-├── .env                        # 환경 변수 (API 키 등 민감 정보)
-└── README.md                   # 프로젝트 문서
+├── build/                      # 빌드 산출물
+└── README.md                   # ...
 ```
 
 ## V. 백테스팅 워크플로우 (Backtesting Workflow)
 본 시스템의 백테스팅은 **'실거래 코드 변경 제로'** 원칙을 기반으로, 실시간 환경의 컴포넌트를 백테스팅용 컴포넌트로 교체하는 방식으로 동작합니다. 이를 통해 전략 코드의 100% 재현성을 보장합니다.
-
-- **`DataFeed Process`**: 실시간 API와 통신하는 대신, 저장된 바이너리 파일을 읽는 **리플레이(Replay) 모드**로 실행됩니다.
-- **`OrderExecutor Process`**: 실제 주문을 내는 대신, 가상 체결을 시뮬레이션하는 **`Backtester Process`**로 대체됩니다.
 
 ```mermaid
 graph TD
@@ -150,35 +122,48 @@ graph TD
 
     %% 백테스팅 데이터 흐름
     LZ4File -- "파일 읽기" --> DataFeed
-    DataFeed -- "과거 데이터 재생 (Write)" --> SharedMemory
-    SharedMemory -- "시장 데이터 읽기 (Read)" --> StrategyRunner
-    StrategyRunner -- "주문 요청 (Write)" --> SharedMemory
+    DataFeed -- "과거 데이터 재생" --> SharedMemory
+    SharedMemory -- "시장 데이터" --> StrategyRunner
+    StrategyRunner -- "주문 요청" --> SharedMemory
     
-    SharedMemory -- "시장 데이터 & 주문 요청 읽기 (Read)" --> Backtester
-    Backtester -- "주문 체결/상태 업데이트 (Write)" --> SharedMemory
+    SharedMemory -- "시장 데이터 & 주문 요청" --> Backtester
+    Backtester -- "주문 체결/상태 업데이트" --> SharedMemory
     Backtester -- "모든 체결 내역 기록" --> ResultFile
 ```
 
-#### 단계별 실행 흐름:
-1.  **데이터 재생**: `DataFeed` 프로세스가 `ReplayGateway`를 통해 `DataRecorder`가 생성한 `.bin.lz4` 파일을 읽습니다. 과거 시장 데이터를 타임스탬프에 맞춰 공유 메모리에 순서대로 '재생'합니다.
-2.  **전략 실행**: `StrategyRunner`는 실거래 환경과 100% 동일하게 동작합니다. 데이터가 라이브 API에서 오는지, 파일에서 오는지 전혀 인지하지 못한 채, 공유 메모리의 데이터를 읽고 거래 결정을 내립니다.
-3.  **가상 체결**: `Backtester` 프로세스는 `OrderExecutor`를 대체합니다. 공유 메모리에서 `StrategyRunner`가 보낸 주문 요청을 읽고, 동시에 재생되는 시장 데이터(호가창 등)와 비교하여 체결을 시뮬레이션합니다.
-4.  **상태 업데이트 및 기록**: `Backtester`는 가상 체결 결과를 다시 공유 메모리에 써서 `StrategyRunner`가 자신의 주문 상태를 추적할 수 있도록 합니다. 동시에, 모든 체결 내역(시간, 가격, 수량, 수수료 등)을 분석하기 쉽도록 `.csv` 파일에 상세히 기록합니다.
-5.  **성과 분석**: 백테스팅 종료 후, 생성된 `.csv` 파일을 Python(Pandas) 등의 도구로 분석하여 전략의 PnL, MDD, 승률과 같은 핵심 성과 지표를 평가합니다.
-
 ## VI. 기술 스택 (Technology Stack)
 - **Language**: C++17
-- **Key Libraries**: Boost (Interprocess, Beast), cURL, nlohmann-json, LZ4
+- **Key Libraries**: Boost (Interprocess, Beast), spdlog, fmt, cURL, nlohmann-json, LZ4
 - **Core Concepts**: Multi-Process Architecture, Shared Memory IPC, Lock-Free Data Structures, Asynchronous I/O
-- **Build System**: CMake with vcpkg (모든 의존성 통일)
+- **Build System**: CMake with vcpkg
+- **Testing & Quality**: Google Test (GTest) for Unit/Integration Testing, Clang-Tidy for Static Analysis
 - **Operating System**: Linux (Ubuntu)
 
-## VII. 향후 개발 로드맵 (Planned Features)
-- **Database**:
-  - **PostgreSQL/TimescaleDB**: 실시간 데이터 단기 저장 및 모니터링 대시보드 연동.
-  - **HDF5**: 장기 데이터 영구 보관(Archiving) 및 복잡한 데이터 분석/ML 연구용 데이터셋 구축.
-- **Monitoring**:
-  - **Terminal UI (TUI)**: `htop`과 같이 터미널에서 시스템 상태(프로세스, PnL)를 실시간으로 확인할 수 있는 경량 모니터링 도구.
-  - **Web-based Dashboard**: 차트 등을 활용한 풍부한 시각화 분석 대시보드.
-- **CI/CD**:
-  - **Docker**: 개발 및 배포 환경을 컨테이너화하여 일관성 확보.
+## VIII. 주요 성과 및 품질 보증 (Key Achievements & Quality Assurance)
+본 시스템은 설계 목표를 달성하기 위해 다음과 같은 구체적인 성과와 품질 보증 체계를 갖추었습니다.
+
+#### A. 정량적 성능 지표 (Quantitative Performance Metrics)
+- **IPC Latency**: 공유 메모리 링 버퍼의 성능 스트레스 테스트 결과, 400만 건의 메시지 전송에 159ms가 소요되어, 메시지당 평균 **약 40 나노초(ns)** 수준의 초저지연 통신을 달성했습니다.
+- **IPC Throughput**: 단일 생산자-소비자 채널에서 초당 **약 2,500만 건**의 이벤트를 처리할 수 있는 높은 처리량을 보입니다. 이는 CPU 캐시 효율을 극대화한 설계의 결과입니다.
+
+#### B. 데이터 무결성 및 시스템 안정성 (Data Integrity & System Stability)
+- **Financial Data Accuracy**: `Boost.Multiprecision` 기반의 `FinancialDecimal` 타입을 자체 구현하여, 모든 금융 계산에서 부동소수점 오류를 원천적으로 배제하고 데이터의 완전한 무결성을 보장합니다.
+- **Long-Term Stability**: WebSocket 연결 유실 시 발생할 수 있는 데이터 오염을 방지하기 위해, 주기적으로 REST API를 통해 전체 오더북 스냅샷을 요청하여 로컬 상태를 보정하는 기능을 구현했습니다.
+
+#### C. 코드 품질 보증 체계 (Code Quality Assurance)
+- **Test-Driven Development**: `GTest` 프레임워크를 기반으로 핵심 로직(IPC 채널, 금융 타입 연산 등)에 대한 단위 테스트 및 통합 테스트를 작성하여 코드의 정확성과 안정성을 검증합니다.
+- **Static Analysis**: `Clang-Tidy`를 빌드 시스템에 통합하여, 잠재적인 버그, 메모리 누수, 안티 패턴 등을 컴파일 시점에 자동으로 검출하고 일관된 코딩 스타일을 유지합니다.
+
+## IX. 발전 방향 및 로드맵 (Future Direction & Roadmap)
+
+#### A. 코어 아키텍처 (Core Architecture)
+- **동적 전략 로딩 (Dynamic Strategy Loading)**: 현재의 정적 컴파일 방식에서 나아가, 시스템 중단 없이 실시간으로 전략을 추가/제거/업데이트할 수 있는 플러그인 아키텍처를 구현합니다. 공유 라이브러리(`.so/.dll`) 기반으로 설계하며, C-style ABI 래퍼를 통해 C++ ABI 안정성 문제를 해결하는 것을 목표로 합니다.
+
+#### B. 데이터 영속성 및 분석 (Data Persistence & Analysis)
+- **PostgreSQL/TimescaleDB**: 실시간 데이터 단기 저장 및 모니터링 대시보드 연동.
+- **HDF5**: 장기 데이터 영구 보관(Archiving) 및 머신러닝 연구용 데이터셋 구축.
+
+#### C. DevOps 및 도구 (DevOps & Tooling)
+- **모니터링 (Monitoring)**: `htop`과 같이 터미널에서 시스템 상태(프로세스, PnL)를 실시간으로 확인할 수 있는 TUI(Terminal UI) 도구 및 웹 기반 대시보드를 개발합니다.
+- **CI/CD**: `GTest`와 `Clang-Tidy`를 포함한 자동화된 빌드/테스트 파이프라인을 구축합니다.
+- **컨테이너화 (Containerization)**: `Docker`를 사용하여 개발 및 배포 환경을 컨테이너화하여 일관성을 확보합니다.
