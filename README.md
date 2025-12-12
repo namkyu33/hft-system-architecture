@@ -1,111 +1,115 @@
-# HftSystem: C++20 기반 초저지연 알고리즘 트레이딩 엔진
-#### (Institutional-Grade Low-Latency Trading System with Shared Memory IPC)
+# HftSystem: C++20 Low Latency Proprietary Trading Engine
+#### High-Performance Trading System featuring Shared Memory IPC & Lock-free Architecture
 
-## I. 프로젝트 개요 (Overview)
-본 프로젝트는 **Boost.Interprocess**를 활용한 **Zero-Copy Shared Memory** 아키텍처를 기반으로, 마이크로초($\mu s$) 단위의 지연 시간(Latency)을 목표로 하는 **C++20 고빈도 매매(HFT) 엔진**입니다.
+[![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://isocpp.org/)
 
-기존의 모놀리식 구조에서 탈피하여 **수집(Feed) - 분석(Analytics) - 전략(Strategy) - 실행(Execution)**을 완벽하게 격리된 프로세스로 분리하였으며, 이를 통해 **장애 격리(Fault Isolation)**와 **무중단 운영**을 실현했습니다.
+## 1. Project Overview (개요)
+**HftSystem**은 **Boost.Interprocess** 기반의 **Zero-Copy Shared Memory** 아키텍처를 적용한 C++ 고빈도 매매(HFT) 엔진입니다.
 
-## II. 시스템 아키텍처 (System Architecture)
-HftSystem은 **역할이 명확하게 분리된 다중 프로세스(Multi-Process)**가 **공유 메모리(Shared Memory)**를 통해 데이터를 전달하는 파이프라인 구조를 채택했습니다. 특히 v7.0부터는 **실시간 분석(Analytics)**과 **실행(Execution)** 계층을 물리적으로 격리하여 안정성을 강화했습니다.
+데이터 수집(Feed), 시장 분석(Analytics), 전략 실행(Strategy), 주문 집행(Execution)을 독립된 프로세스로 분리하여 **마이크로초($\mu s$) 단위의 처리 속도**와 **프로세스 간 장애 격리(Fault Isolation)**를 구현했습니다.
+
+---
+
+## 2. Key Features (핵심 기능)
+*   🚀 **Low Latency IPC:** 커널 개입 없는 **Zero-Copy** 방식과 자체 구현한 **Lock-free RingBuffer**를 통해 프로세스 간 통신 지연을 **40ns** 수준으로 최적화.
+*   🛡️ **Financial Integrity:** 부동소수점 오차를 원천 차단하기 위해 **256비트 정수(`int256_t`)** 기반의 **`FinancialDecimal`** 타입과 **Strong Typing** 시스템 적용.
+*   🧠 **Decoupled Analytics:** 데이터 피드의 연산 부하를 제거하고, 전략 프로세스 내 **`AnalyticsEngine`**에서 지표(OFI, VPIN)를 필요시 계산(On-Demand).
+*   🌐 **Multi-Exchange Arbitrage:** 단일 전략 프로세스가 다수 거래소(Exchange A, B)의 공유 메모리에 동시 접속하여 **실시간 시세 괴리 포착**.
+*   🧩 **Flexible Configuration:** `StrategyFactory` 패턴과 JSON 설정을 적용하여, 재컴파일 없이 전략 파라미터 튜닝 가능.
+
+---
+
+## 3. System Architecture (아키텍처)
+
+이벤트 기반의 멀티 프로세스 구조로, 각 모듈은 공유 메모리(Shared Memory)를 데이터 버스(Data Bus)로 사용합니다.
 
 ```mermaid
 graph TD
+    %% Nodes
     subgraph "Market Data Layer"
-        ExchangeAPI["Exchange API\n(WebSocket)"]
-        FeedHandler["FeedHandler Process\n(Validation & Normalization)"]
+        FeedA["FeedHandler A (WS to SHM)"]
+        FeedB["FeedHandler B (WS to SHM)"]
     end
 
-    subgraph "Shared Memory (IPC)"
-        SHM_Book[("RingBuffer: OrderBook")]
-        SHM_Trade[("RingBuffer: Trade")]
-        SHM_Req[("RingBuffer: Request")]
-        SHM_Info[("RingBuffer: OrderInfo")]
+    subgraph "Shared Memory Bus (IPC)"
+        SHM_A[("SHM: Exchange A")]
+        SHM_B[("SHM: Exchange B")]
+        SHM_Order[("SHM: Order Request")]
     end
     
-    subgraph "Core Logic Layer"
-        StrategyRunner["StrategyRunner Process"]
-        AnalyticsLib["Analytics Engine\n(OFI, VPIN, Volatility)"]
-    end
-
-    subgraph "Execution & Data Layer"
-        OrderExecutor["OrderExecutor Process\n(Risk Check & API Call)"]
-        DataRecorder["DataRecorder Process\n(Binary Logging)"]
-        LogConverter["LogConverter Tool\n(Bin -> Parquet)"]
+    subgraph "Strategy Layer"
+        ArbStrategy["Arbitrage Strategy (Multi-SHM Reader)"]
+        Analytics["Analytics Engine"]
     end
 
-    %% Flow
-    ExchangeAPI --> FeedHandler
-    FeedHandler -- "Write" --> SHM_Book & SHM_Trade
+    subgraph "Execution Layer"
+        Executor["Order Executor (Risk Check)"]
+        ExchangeAPI["Exchange Gateway (REST/WS)"]
+    end
+
+    subgraph "Data Layer"
+        Recorder["Data Recorder (LZ4 Archiver)"]
+    end
+
+    %% Edges
+    FeedA -- "Write Raw" --> SHM_A
+    FeedB -- "Write Raw" --> SHM_B
     
-    SHM_Book & SHM_Trade -- "Read" --> StrategyRunner
-    StrategyRunner -- "Use" --> AnalyticsLib
-    AnalyticsLib -- "Indicators" --> StrategyRunner
+    SHM_A -- "Read (Zero-Copy)" --> ArbStrategy
+    SHM_B -- "Read (Zero-Copy)" --> ArbStrategy
     
-    StrategyRunner -- "Write Request" --> SHM_Req
-    SHM_Req -- "Read" --> OrderExecutor
-    OrderExecutor -- "Execution" --> ExchangeAPI
-    OrderExecutor -- "Write Result" --> SHM_Info
+    ArbStrategy -- "Compute" --> Analytics
+    ArbStrategy -- "Signal" --> SHM_Order
     
-    SHM_Book & SHM_Trade & SHM_Info -- "Read" --> DataRecorder
-    DataRecorder --> LogConverter
+    SHM_Order -- "Read" --> Executor
+    Executor -- "Pre-Trade Check" --> ExchangeAPI
+    
+    SHM_A -.-> Recorder
+    SHM_B -.-> Recorder
 ```
 
-- **FeedHandler**: 거래소 시세를 수신하여 검증(Validation) 및 정규화 후 SHM에 쓰는 **유일한 생산자(Producer)**입니다.
-- **Analytics Engine**: 시장 미세구조(Market Microstructure) 지표인 OFI, VPIN, Volatility 등을 계산하는 독립 라이브러리입니다. 전략 프로세스 내에서 실행되며 공유 메모리의 Raw Data를 실시간으로 가공합니다.
-- **StrategyRunner**: 오직 SHM 데이터만 읽고 판단하여 주문 요청을 생성합니다. 네트워크 I/O가 전혀 없어 판단 속도가 극대화됩니다.
-- **OrderExecutor**: 기존 엔진 내부 모듈에서 **독립 프로세스**로 분리되었습니다. 전략의 상태와 무관하게 독자적으로 리스크를 관리(Pre-trade Check)하고 주문을 집행하며, 다중 거래소(Multi-Exchange)를 지원합니다.
-- **DataRecorder**: 모든 틱 데이터를 손실 없이 **LZ4 압축 바이너리**로 저장합니다.
+### 3.1. Core Components
+| Component | Role & Responsibility | Tech Stack |
+| :--- | :--- | :--- |
+| **FeedHandler** | 거래소 시세 수신, 정합성 검증(Validator), 정규화 | Boost.Beast (WS), OrderBook Reconstruction |
+| **StrategyRunner** | 다중 거래소 데이터 수신, 알파 시그널 계산, 주문 생성 | Multi-SHM Binding, Analytics Engine |
+| **OrderExecutor** | 주문 요청 수신, 사전 리스크 통제, API 전송, 체결 관리 | In-line Risk Engine, Generic Gateway |
+| **DataRecorder** | 틱 데이터 고속 로깅 (손실 압축 없음) | LZ4 Compression, Async I/O, Retry Logic |
 
-## III. 핵심 설계 결정 (Key Design Decisions)
+---
 
-### A. 극한의 성능 최적화 (Extreme Performance)
-- **Lock-free RingBuffer**: `std::mutex` 대신 `std::atomic`과 `_mm_pause()`(Spinlock)를 사용하여 컨텍스트 스위칭 비용을 제거했습니다. (Avg IPC Latency: ~40ns).
-- **Zero-Copy IPC**: 프로세스 간 데이터 전달 시 직렬화/역직렬화 비용이 없는 Raw Memory Copy 방식을 사용합니다.
-- **CPU Pinning**: 주요 스레드(Feed, Strategy, Executor)를 특정 코어에 고정(Affinity)하여 L1/L2 캐시 적중률을 극대화하고 Jitter를 방지했습니다.
+## 4. Technical Details (기술 상세)
 
-### B. 데이터 무결성을 위한 타입 시스템 (Strong Typing for Data Integrity)
-- **목적**: 금융 연산에서 `double` 사용 시 발생하는 부동소수점 오차를 원천 차단합니다.
-- **구현**: **`FinancialDecimal`** 클래스를 통해 256비트 정수(`int256_t`) 기반의 고정소수점 연산을 수행합니다. 또한, `Price`, `Quantity`, `Amount`를 서로 다른 타입으로 정의하는 **Strong Typing**을 적용하여, 가격과 수량을 더하는 등의 논리적 오류를 컴파일 타임에 방지합니다.
+### A. Data Integrity (데이터 무결성)
+금융 시스템의 정밀도를 위해 `double` 자료형 사용을 배제했습니다.
+*   **Implementation:** `int256_t` 기반의 고정 소수점 타입 **`FinancialDecimal`** 구현.
+*   **Strong Typing:** `Price`, `Quantity`, `Amount`를 서로 다른 타입으로 정의하여, '가격 + 수량' 같은 논리적 오류를 컴파일 타임에 방지.
 
-### C. 분석 엔진의 모듈화 (Modular Analytics Engine)
-- **목적**: 전략 로직과 시장 분석 로직의 결합도를 낮추고, 다양한 지표를 레고 블록처럼 조합하여 사용합니다.
-- **구현**: `OFI`, `VPIN`, `FlowMetrics` 등의 지표를 `analytics` 라이브러리로 분리했습니다. 각 지표는 런타임에 파라미터(Window Size, Decay Factor) 튜닝이 가능하며, 전략은 필요한 지표만 선택적으로 활성화하여 CPU 자원을 최적화합니다.
+### B. Optimized Memory Layout (메모리 최적화)
+*   **POD (Plain Old Data):** 공유 메모리에 저장되는 모든 구조체는 `#pragma pack(1)`을 적용하여 패딩(Padding)을 제거하고 캐시 효율성(Cache Locality)을 높였습니다.
+*   **Lock-free RingBuffer:** Mutex(Lock)를 사용하지 않고 `std::atomic`과 `memory_order_acquire/release`를 활용한 SPSC 큐를 구현하여 스레드 경합(Contention)을 제거했습니다.
 
-### D. 확장성 및 유연성 (Scalability)
-- **Interface-based Design**: `IExchangeGateway`, `IStrategy` 인터페이스를 통해 거래소와 전략을 플러그인처럼 쉽게 추가할 수 있습니다.
-- **Factory Pattern**: `GatewayFactory`, `StrategyFactory`를 통해 설정 파일(JSON)만으로 런타임에 동적으로 객체를 생성하고 조립합니다.
+### C. Risk Management System (RMS)
+주문 안정성을 위해 `OrderExecutor` 내부에 리스크 엔진을 내재화(In-line)하였습니다.
+*   **Max Notional Check:** 주문 전송 직전(<1µs), `Price * Quantity`가 설정된 한도를 초과하는지 검증.
+*   **Fat-finger Protection:** 비정상적인 가격 괴리나 수량 입력을 차단하여 운영 실수 방지.
 
-## IV. 디렉터리 구조 (Directory Structure)
-```text
-hftsystem/
-├── analytics/          # [NEW] 시장 분석 지표 엔진 (OFI, VPIN 등)
-├── api/                # 거래소별 REST/WS 클라이언트 구현체
-├── common/             # 전역 공통 타입 (FinancialDecimal, RingBuffer)
-├── config/             # 시스템 및 전략 설정 (JSON)
-├── data_store/         # Shared Memory 관리자 및 Reader/Writer
-├── factories/          # 객체 생성 팩토리 (Strategy, Client)
-├── gateways/           # 거래소 연결 및 데이터 정규화 (Snapshotter 포함)
-├── interfaces/         # 최상위 추상 인터페이스
-├── managers/           # 핵심 매니저 (Risk, Trade, Order, Account)
-├── processes/          # 실행 프로세스 (Main Entry Points)
-│   ├── data_feed/      # 시세 수집기
-│   ├── order_executor/ # 주문 실행기
-│   ├── data_recorder/  # 데이터 기록기
-│   └── strategy_runner/# 전략 실행기
-├── strategies/         # 매매 전략 구현체 (Grid, Arbitrage)
-├── tools/              # [NEW] 유틸리티 (LogConverter, MarketSnapshot)
-└── utils/              # 로거, 시간, JSON 파싱 유틸리티
-```
+### D. Extensibility (확장성)
+*   **Factory Pattern:** `StrategyFactory`를 통해 설정 파일(JSON)의 ID만으로 전략 객체를 런타임에 동적으로 생성.
+*   **Config-Driven:** 전략 로직(Code)과 설정(Data)을 분리하여, 재컴파일 없이 파라미터 수정 가능.
 
-## V. 데이터 파이프라인 (Data Pipeline)
-본 시스템은 실시간 트레이딩뿐만 아니라, 정밀한 사후 분석을 위한 데이터 파이프라인을 갖추고 있습니다.
+---
 
-1.  **실시간 기록 (Recording)**: `DataRecorder`가 공유 메모리의 모든 틱(Tick) 데이터를 손실 없이 압축(`LZ4`)하여 바이너리 파일로 저장합니다. (Multiplexed Format).
-2.  **데이터 변환 (Conversion)**: `LogConverter` 툴을 사용하여 바이너리 로그를 **Apache Parquet** 포맷으로 변환합니다. 이는 Python(Pandas) 및 대용량 분석 도구와의 호환성을 보장합니다.
-3.  **스냅샷 모니터링**: `market_data_logger` 툴을 통해 다중 거래소의 호가 스프레드를 1초 단위 CSV로 실시간 기록하여 차익거래 기회를 모니터링합니다.
+## 5. Development Environment
+*   **OS:** Linux (Ubuntu 22.04 LTS recommended)
+*   **Compiler:** GCC 11+ or Clang 14+ (C++20 Support)
+*   **Build System:** CMake 3.20+
+*   **Dependencies:** Boost 1.78+, OpenSSL, LZ4, Apache Arrow/Parquet, nlohmann/json, spdlog, fmt
 
-## VI. 주요 성과 및 품질 보증 (Achievements)
-- **Financial Data Accuracy**: 256비트 정수 연산을 통해 모든 거래 및 자산 계산의 무결성을 보장합니다.
-- **Resilience**: WebSocket 연결 유실 시 `Snapshotter` 스레드가 자동으로 REST API를 통해 오더북 정합성을 복구합니다.
-- **Latency**: 내부 벤치마크 결과, IPC 구간에서 평균 40ns 내외의 지연 시간을 달성했습니다.
+---
+
+## 6. Future Roadmap
+*   **Real-time Dashboard (TUI):** `market_snapshot` 툴을 고도화하여, 터미널 환경에서 호가 스프레드, 체결 내역, 실시간 PnL을 시각화하는 **ncurses 기반 TUI(Text User Interface)** 개발.
+*   **Remote Alert System:** 텔레그램(Telegram) API를 연동하여 주문 체결, 프로세스 비정상 종료, 에러 발생 시 운영자에게 즉시 푸시 알림을 전송하는 **24/7 관제 시스템** 구축.
+*   **Global Kill Switch:** 시장 급변이나 로직 오류 감지 시, 단일 명령으로 모든 프로세스를 동결하고 미체결 주문을 일괄 취소하는 **비상 제동 장치(Emergency Stop)** 구현.
+*   **Optimization:** `simdjson` 도입을 통한 JSON 파싱 가속 및 `TCP_NODELAY` 튜닝을 통해 Tick-to-Trade 레이턴시 추가 단축.
